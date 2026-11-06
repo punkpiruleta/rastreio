@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Onde você está?</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#fff; --fg:#111; --card:#fff; --accent:#2563eb; --other:#e11d48; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#f3f3f3; --card:#1e1e1e; } }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  #map { position: fixed; inset: 0; }
+  .card { background: var(--card); color: var(--fg); border-radius: 14px; box-shadow: 0 2px 14px rgba(0,0,0,.25); }
+  #join { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 1000; background: var(--bg); }
+  #join .card { width: 100%; max-width: 360px; padding: 24px; }
+  h1 { font-size: 1.3rem; margin: 0 0 6px; }
+  p { margin: 0 0 16px; opacity: .75; font-size: .95rem; }
+  input, button { width: 100%; font-size: 1rem; padding: 12px; border-radius: 10px; border: 1px solid #8884; margin-bottom: 10px; background: transparent; color: inherit; }
+  button { background: var(--accent); color: #fff; border: 0; font-weight: 600; cursor: pointer; }
+  #top { position: fixed; top: calc(10px + env(safe-area-inset-top, 0px)); left: 10px; right: 10px; z-index: 500; padding: 12px 14px; display: none; }
+  #top b { font-size: 1.15rem; }
+  #status { font-size: .85rem; opacity: .75; margin-top: 2px; }
+  #center { position: fixed; right: 12px; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); z-index: 500; width: auto; padding: 12px 16px; display: none; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="join">
+  <div class="card">
+    <h1>📍 Onde você está?</h1>
+    <p>Os dois entram com o mesmo código de sala para se verem no mapa.</p>
+    <input id="name" placeholder="Seu nome" maxlength="20" autocomplete="off">
+    <input id="room" placeholder="Código da sala (ex: casa123)" maxlength="40" autocapitalize="off" autocomplete="off">
+    <button id="go">Entrar</button>
+  </div>
+</div>
+
+<div id="top" class="card">
+  <b id="dist">Aguardando a outra pessoa…</b>
+  <div id="status"></div>
+</div>
+<button id="center">Centralizar</button>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const myId = localStorage.getItem('uid') || (() => {
+  const v = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  localStorage.setItem('uid', v); return v;
+})();
+$('#name').value = localStorage.getItem('name') || '';
+$('#room').value = localStorage.getItem('room') || '';
+
+let ws, map, line, last = null, fitted = false, room, name;
+const users = {}, markers = {};
+
+$('#go').onclick = () => {
+  name = $('#name').value.trim() || 'Eu';
+  room = $('#room').value.trim();
+  if (!room) return $('#room').focus();
+  localStorage.setItem('name', name); localStorage.setItem('room', room);
+  $('#join').style.display = 'none';
+  $('#top').style.display = 'block';
+  $('#center').style.display = 'block';
+  map = L.map('map', { zoomControl: false }).setView([-14.2, -51.9], 4);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '© OpenStreetMap'
+  }).addTo(map);
+  connect(); startGeo();
+};
+
+$('#center').onclick = () => fit(true);
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}`);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'join', room, name, id: myId }));
+    if (last) ws.send(JSON.stringify({ type: 'pos', ...last }));
+    setStatus('Conectado');
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'full') { setStatus('Sala cheia (máx. 2 pessoas)'); ws.close(); return; }
+    if (m.type === 'state') {
+      const ids = m.users.map((u) => u.id);
+      Object.keys(users).forEach((id) => { if (id !== myId && !ids.includes(id)) remove(id); });
+      m.users.forEach((u) => { if (u.id !== myId) users[u.id] = u; });
+      render();
+    }
+  };
+  ws.onclose = () => { setStatus('Reconectando…'); setTimeout(connect, 2000); };
+}
+
+function startGeo() {
+  if (!navigator.geolocation) return setStatus('Seu navegador não tem GPS');
+  navigator.geolocation.watchPosition((p) => {
+    last = { lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy };
+    users[myId] = { id: myId, name: name + ' (você)', ...last };
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'pos', ...last }));
+    render();
+  }, (err) => setStatus('Permita o acesso à localização (' + err.message + ')'),
+  { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
+}
+
+function remove(id) {
+  if (markers[id]) { map.removeLayer(markers[id]); delete markers[id]; }
+  delete users[id];
+}
+
+function render() {
+  const pts = [];
+  for (const [id, u] of Object.entries(users)) {
+    if (u.lat == null) continue;
+    const ll = [u.lat, u.lng];
+    pts.push(ll);
+    if (!markers[id]) {
+      markers[id] = L.circleMarker(ll, {
+        radius: 10, weight: 3, color: '#fff', fillOpacity: 1,
+        fillColor: id === myId ? '#2563eb' : '#e11d48'
+      }).addTo(map).bindTooltip(u.name, { permanent: true, direction: 'top', offset: [0, -10] });
+    } else {
+      markers[id].setLatLng(ll).setTooltipContent(u.name);
+    }
+  }
+  if (pts.length === 2) {
+    if (!line) line = L.polyline(pts, { color: '#888', dashArray: '6 8' }).addTo(map);
+    else line.setLatLngs(pts);
+    const d = map.distance(pts[0], pts[1]);
+    $('#dist').textContent = 'Distância: ' + (d < 1000 ? Math.round(d) + ' m' : (d / 1000).toFixed(2) + ' km');
+    if (!fitted) { fit(); fitted = true; }
+  } else {
+    if (line) { map.removeLayer(line); line = null; }
+    $('#dist').textContent = 'Aguardando a outra pessoa…';
+    if (pts.length === 1 && !fitted) { map.setView(pts[0], 16); }
+  }
+}
+
+function fit() {
+  const pts = Object.values(users).filter((u) => u.lat != null).map((u) => [u.lat, u.lng]);
+  if (pts.length >= 2) map.fitBounds(pts, { padding: [70, 70], maxZoom: 17 });
+  else if (pts.length === 1) map.setView(pts[0], 16);
+}
+
+function setStatus(t) { $('#status').textContent = t + ' · sala: ' + room; }
+</script>
+</body>
+</html>
